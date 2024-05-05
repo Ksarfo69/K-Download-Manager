@@ -1,5 +1,7 @@
 .venv
 chunks
 downloads
-dm.json
 .idea
+*.db
+.DS_Store
+__pycache__

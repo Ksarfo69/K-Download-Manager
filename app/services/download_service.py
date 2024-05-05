@@ -1,107 +1,33 @@
-import argparse
 import asyncio
-import json
 import os.path
 import shutil
 import signal
 from datetime import datetime
 
 import aiohttp
+from fastapi import HTTPException
+from sqlalchemy import desc
 
-DB_PATH = os.path.join(os.path.realpath(os.path.dirname(__file__)), "dm.json")
-if not os.path.exists(DB_PATH):
-    with open(DB_PATH, "w") as f:
-        f.write("{}")
-
-DOWNLOADS_FOLDER = os.path.join(os.path.realpath(os.path.dirname(__file__)), "downloads")
-if not os.path.exists(DOWNLOADS_FOLDER):
-    os.makedirs(DOWNLOADS_FOLDER)
-
-CHUNKS_FOLDER = os.path.join(os.path.realpath(os.path.dirname(__file__)), "chunks")
-if not os.path.exists(CHUNKS_FOLDER):
-    os.makedirs(CHUNKS_FOLDER)
+from app.models.download_file_state import DownloadFileState
+from app.models.kdm_settings import KDMSettings
+from app.schemas import KDMSettingsPayload
+from app.services.db_service import sadbs
 
 
-class DownloadFileState:
-    def __init__(self,
-                 url,
-                 max_connections,
-                 chunk_size,
-                 cap,
-                 save_as,
-                 filename,
-                 chunks_folder,
-                 downloaded_size,
-                 content_size,
-                 formatted_content_size,
-                 complete,
-                 in_progress,
-                 download_start,
-                 downloaded_size_this_session,
-                 downloaded_file_path):
-        self.url = url
-        self.max_connections = max_connections
-        self.chunk_size = chunk_size
-        self.cap = cap
-        self.save_as = save_as
-        self.filename = filename
-        self.chunks_folder = chunks_folder
-        self.downloaded_size = downloaded_size
-        self.content_size = content_size
-        self.complete = complete
-        self.in_progress = in_progress
-        self.formatted_content_size = formatted_content_size
-        self.download_start = download_start
-        self.downloaded_size_this_session = downloaded_size_this_session
-        self.downloaded_file_path = downloaded_file_path
-
-    def __hash__(self):
-        return self.url.__hash__()
-
-    def __eq__(self, other):
-        return self.url == other.url
-
-    def to_dict(self):
-        serial = self.__dict__
-
-        return serial
-
-    @classmethod
-    def from_dict(cls, serial: dict):
-        obj = DownloadFileState(**serial)
-
-        return obj
-
-    def new_session(self):
-        self.downloaded_size_this_session = 0
-        self.in_progress = False
-
-    def add_chunk(self, size: int):
-        self.downloaded_size += size
-        self.downloaded_size_this_session += size
-
-        if self.downloaded_size >= self.content_size:
-            self.in_progress = False
-            self.complete = True
-
-
-class DownloadManager:
+class KDownloadService:
     def __init__(self):
-        with open(DB_PATH, 'r') as f:
-            json_ = json.load(f)
-            self.downloads = {}
-            for k, v in json_.items():
-                dfs = DownloadFileState.from_dict(v)
-                dfs.new_session()
-                self.downloads[k] = dfs
+        self.lock = None
+        self.running_tasks = None
+
+    async def init(self):
+        await sadbs.update(DownloadFileState, {DownloadFileState.downloaded_size_this_session: 0,
+                                               DownloadFileState.in_progress: False})
 
         self.running_tasks = 0
         self.lock = asyncio.Lock()
         asyncio.create_task(self.start_sigint_listener())
-        asyncio.create_task(self.__track_download_state_changes())
-        asyncio.create_task(self.__print_download_stats())
 
-    async def add(self, **kwargs):
+    async def add(self, url):
         print("-" * 160)
         print(r"""
  _                       _______ _________ _        _______        ______   _______           _        _        _______  _______  ______   _______  _______   
@@ -113,24 +39,30 @@ class DownloadManager:
 |  /  \ \               | )      ___) (___| (____/\| (____/\      | (__/  )| (___) || () () || )  \  || (____/\| (___) || )   ( || (__/  )| (____/\| ) \ \__  
 |_/    \/               |/       \_______/(_______/(_______/      (______/ (_______)(_______)|/    )_)(_______/(_______)|/     \|(______/ (_______/|/   \__/                                                                                                                                                                                                                                                                                                               
         """)
-        url = kwargs['url']
-        if url in self.downloads:
-            dfs: DownloadFileState = self.downloads[url]
-            if dfs.complete:
-                print(f"File already downloaded. Path: {dfs.downloaded_file_path}")
-            else:
-                max_connections: int = kwargs.get('max_connections')
-                if max_connections:
-                    dfs.max_connections = max_connections
-                await self.resume(dfs)
-        else:
-            await self.download(**kwargs)
 
-    async def download(self, url, max_connections=8, chunk_size=512000, cap=None, save_as=None):
+        exists = await sadbs.get(DownloadFileState, condition=DownloadFileState.url == url)
+        kdm_settings: KDMSettings = await self.get_preferences()
+        if exists:
+            dfs: DownloadFileState = exists
+            if dfs.in_progress:
+                raise HTTPException(status_code=409, detail="Already in progress.")
+            elif dfs.complete and os.path.exists(dfs.downloaded_file_path):
+                msg = f"File already downloaded. Path: {dfs.downloaded_file_path}"
+                print(msg)
+                raise HTTPException(status_code=409, detail=msg)
+            elif dfs.complete:
+                dfs.init_because_missing()
+                return await self.resume(dfs, kdm_settings)
+            else:
+                return await self.resume(dfs, kdm_settings)
+        else:
+            return await self.download(url, kdm_settings)
+
+    async def download(self, url, kdm_settings: KDMSettings, save_as=None) -> DownloadFileState:
         filename: str = save_as if save_as else await self.__extract_filename(url)
-        chunks_folder: str = await self.__get_chunks_folder_name(filename)
         content_size: int = await self.__get_content_size(url=url)
         formatted_content_size: str = await self.__calculate_semantic_size(content_size)
+        chunks_folder: str = await self.__get_chunks_folder_name(filename, kdm_settings.downloads_location)
 
         if not os.path.exists(chunks_folder):
             os.makedirs(chunks_folder)
@@ -140,9 +72,8 @@ class DownloadManager:
 
         dfs: DownloadFileState = DownloadFileState(
             url=url,
-            max_connections=max_connections,
-            chunk_size=chunk_size,
-            cap=cap,
+            max_connections=kdm_settings.max_connections,
+            chunk_size=kdm_settings.chunk_size,
             save_as=save_as,
             filename=filename,
             chunks_folder=chunks_folder,
@@ -151,27 +82,26 @@ class DownloadManager:
             in_progress=True,
             complete=False,
             formatted_content_size=formatted_content_size,
-            download_start=download_start.isoformat(),
+            download_start=download_start,
             downloaded_size_this_session=0,
             downloaded_file_path=None
         )
 
-        self.downloads[dfs.url] = dfs
-        await self.__update_download_states_now()
+        await sadbs.insert(dfs)
 
-        formatted_cap = await self.__calculate_semantic_size(cap) if cap else None
         print(f"Downloading url: {url}, "
-              f"max connections: {max_connections}, "
-              f"chunk_size: {chunk_size}, "
-              f"cap:{f'{formatted_cap}' if cap else None}")
+              f"max connections: {kdm_settings.max_connections}, "
+              f"chunk_size: {kdm_settings.chunk_size}")
 
-        await self.download_in_chunks(offset=0, dfs=dfs)
+        asyncio.create_task(self.download_in_chunks(offset=0, dfs=dfs, kdm_settings=kdm_settings))
 
-    async def resume(self, dfs: DownloadFileState):
+        r = dfs.to_pydantic_model()
+
+        return r
+
+    async def resume(self, dfs: DownloadFileState, kdm_settings: KDMSettings):
         print(f"Resuming file {dfs.filename}...")
-        dfs.download_start = datetime.now().isoformat()
-        dfs.in_progress = True
-        dfs.downloaded_size = 0
+        dfs.resuming()
 
         incomplete_chunks = []
         last_chunk_upper_bound = 0
@@ -206,18 +136,24 @@ class DownloadManager:
             missing_chunks = await self.__ensure_continuity(dfs, dir_files)
 
         print(f"Successfully resumed file {dfs.filename}, continuing download...")
-        await self.download_in_chunks(offset=offset, dfs=dfs, missing_chunks=missing_chunks)
+        asyncio.create_task(self.download_in_chunks(offset=offset, dfs=dfs, missing_chunks=missing_chunks, kdm_settings=kdm_settings))
 
-    async def download_in_chunks(self, offset, dfs: DownloadFileState, missing_chunks: None | list = None):
-        cap = dfs.cap
+        r = dfs.to_pydantic_model()
+
+        return r
+
+    async def download_in_chunks(self,
+                                 offset,
+                                 dfs: DownloadFileState,
+                                 kdm_settings: KDMSettings,
+                                 missing_chunks: None | list = None):
         content_size = dfs.content_size
         max_connections = dfs.max_connections
         chunk_size = dfs.chunk_size
-        limit = cap if cap and cap < content_size else content_size
 
-        while missing_chunks or dfs.downloaded_size < limit:
+        while missing_chunks or dfs.downloaded_size < content_size:
             if self.running_tasks < max_connections:
-                if len(missing_chunks) > 0:
+                if missing_chunks and len(missing_chunks) > 0:
                     chunk_range_ = missing_chunks.pop()
                     start_end = chunk_range_.split("-")
                     start = int(start_end[0])
@@ -225,7 +161,7 @@ class DownloadManager:
 
                     asyncio.create_task(self.chunk_download_task(dfs, start, end))
                 else:
-                    if offset < limit:
+                    if offset < content_size:
                         start = offset
                         remaining_size = content_size - offset
                         if remaining_size <= chunk_size:
@@ -235,13 +171,13 @@ class DownloadManager:
                             end = offset + chunk_size - 1
                             offset += chunk_size
 
-                        asyncio.create_task(self.chunk_download_task(dfs, start, end))
+                        t = asyncio.create_task(self.chunk_download_task(dfs, start, end))
 
                 self.running_tasks += 1
             else:
                 await asyncio.sleep(0.5)
 
-        downloaded_file_path = await self.__combine_chunks(dfs)
+        downloaded_file_path = await self.__combine_chunks(dfs, kdm_settings)
 
         print(
             f"\nFile downloaded successfully, path: {downloaded_file_path}.")
@@ -271,6 +207,8 @@ class DownloadManager:
 
                         async with self.lock:
                             dfs.add_chunk(chunk_response.content_length)
+
+                            await sadbs.insert(dfs)
                     else:
                         raise Exception(f"Expected {expected_bytes} but received {chunk_response.content_length}")
 
@@ -283,61 +221,90 @@ class DownloadManager:
                         print("\n")
                         exit(e)
 
-    async def __track_download_state_changes(self):
-        while True:
-            payload = {k: v.to_dict() for k, v in self.downloads.items()}
-            with open(DB_PATH, 'w') as f:
-                json.dump(payload, f, indent=4)
+    async def get_preferences(self):
+        r = await sadbs.get_all(KDMSettings)
 
-            await asyncio.sleep(5)
+        if len(r) == 0:
+            preferences = KDMSettings()
+            await sadbs.insert(preferences)
+        else:
+            preferences: KDMSettings = r[0]
 
-    async def __update_download_states_now(self):
-        payload = {k: v.to_dict() for k, v in self.downloads.items()}
-        with open(DB_PATH, 'w') as f:
-            json.dump(payload, f, indent=4)
+        return await preferences.to_pydantic_model()
 
-    async def __print_download_stats(self):
-        while True:
-            items: [str, DownloadFileState] = self.downloads.copy().items()
-            for _, dfs in items:
-                if dfs.in_progress:
-                    download_start = datetime.fromisoformat(dfs.download_start)
-                    seconds_elapsed = (datetime.now() - download_start).seconds or 1
+    async def update_preferences(self, preferences: KDMSettingsPayload):
+        r = await sadbs.get_all(KDMSettings)
+        exists: KDMSettings = r[0]
 
-                    percentage = round((dfs.downloaded_size / dfs.content_size) * 100, 2)
+        exists.max_connections = preferences.max_connections
+        exists.chunk_size = preferences.chunk_size
+        exists.downloads_location = preferences.downloads_location
 
-                    download_speed_task = asyncio.create_task(
-                        self.__calculate_download_speed(dfs.downloaded_size_this_session, seconds_elapsed))
-                    formatted_downloaded_size__task = asyncio.create_task(
-                        self.__calculate_semantic_size(dfs.downloaded_size))
-                    est_time_remaining_task = asyncio.create_task(
-                        self._estimate_remaining_time(dfs.content_size,
-                                                      dfs.downloaded_size,
-                                                      dfs.downloaded_size_this_session,
-                                                      seconds_elapsed))
+        await sadbs.insert(exists)
 
-                    tasks = [download_speed_task, formatted_downloaded_size__task, est_time_remaining_task]
+    async def get_history(self, in_progress, start, limit):
+        condition = DownloadFileState.in_progress == in_progress if in_progress else None
+        r = await sadbs.get_all(DownloadFileState, condition=condition,
+                                order_by=desc(DownloadFileState.download_start), offset=start, limit=limit)
+        return [dfs.to_pydantic_model() for dfs in r]
 
-                    res = await asyncio.gather(*tasks)
+    async def get_download_state_events(self):
+        events = None
+        items: list[DownloadFileState] = await sadbs.get_all(DownloadFileState,
+                                                             condition=DownloadFileState.in_progress == True)
+        for dfs in items:
+            events = events or []
+            seconds_elapsed = (datetime.now() - dfs.download_start).seconds or 1
 
-                    print(
-                        f'\rFilename: {dfs.filename} |'
-                        f' Progress: {percentage}% |'
-                        f' Download Speed: {res[0]} |'
-                        f' Downloaded: {res[1]}/{dfs.formatted_content_size} |'
-                        f' ETA: {res[2]}',
-                        end='', flush=True)
+            percentage = round((dfs.downloaded_size / dfs.content_size) * 100, 2)
 
-            await asyncio.sleep(1)
+            download_speed_task = asyncio.create_task(
+                self.__calculate_download_speed(dfs.downloaded_size_this_session, seconds_elapsed))
+            formatted_downloaded_size__task = asyncio.create_task(
+                self.__calculate_semantic_size(dfs.downloaded_size))
+            est_time_remaining_task = asyncio.create_task(
+                self._estimate_remaining_time(dfs.content_size,
+                                              dfs.downloaded_size,
+                                              dfs.downloaded_size_this_session,
+                                              seconds_elapsed))
 
-    async def __get_chunks_folder_name(self, filename: str):
+            tasks = [download_speed_task, formatted_downloaded_size__task, est_time_remaining_task]
+
+            res = await asyncio.gather(*tasks)
+
+            event = {
+                "Filename": dfs.filename,
+                "Progress": f'{percentage}%',
+                "Download Speed": res[0],
+                "Downloaded": f'{res[1]}/{dfs.formatted_content_size}',
+                "ETA": res[2],
+            }
+
+            print(
+                f'\rFilename: {dfs.filename} |'
+                f' Progress: {percentage}% |'
+                f' Download Speed: {res[0]} |'
+                f' Downloaded: {res[1]}/{dfs.formatted_content_size} |'
+                f' ETA: {res[2]}',
+                end='', flush=True)
+
+            events.append(event)
+
+        return events
+
+    async def __get_chunks_folder_name(self, filename: str, base_dir: str):
         print("Creating folder for chunks ...")
         folder_name = ""
 
         for c in filename:
             folder_name += str(ord(c))
 
-        folder_path = os.path.join(CHUNKS_FOLDER, folder_name)
+        chunks_folder = os.path.join(base_dir, ".kdm_chunks")
+
+        if not os.path.exists(chunks_folder):
+            os.makedirs(chunks_folder)
+
+        folder_path = os.path.join(chunks_folder, folder_name)
 
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
@@ -361,26 +328,29 @@ class DownloadManager:
     async def __get_content_size(self, url: str):
         print("Retrieving content size from server ...")
 
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                'Range': 'bytes=0-0'
-            }
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Range': 'bytes=0-0'
+                }
 
-            response = await session.get(url, headers=headers)
-            response_headers = response.headers
-            content_range = response_headers.get('Content-Range')
+                response = await session.get(url, headers=headers)
+                response_headers = response.headers
+                content_range = response_headers.get('Content-Range')
 
-            if not content_range:
-                exit(
-                    "Failed to retrieve content size from server. Please ensure the server supports partial content delivery.")
+                if not content_range:
+                    exit(
+                        "Failed to retrieve content size from server. Please ensure the server supports partial content delivery.")
 
-            content_size = int(content_range.split('/')[1]) - 1
+                content_size = int(content_range.split('/')[1]) - 1
 
-            formatted_content_size = await self.__calculate_semantic_size(content_size)
+                formatted_content_size = await self.__calculate_semantic_size(content_size)
 
-            print(f"Retrieved content size from server. Content size: {formatted_content_size}")
+                print(f"Retrieved content size from server. Content size: {formatted_content_size}")
 
-            return content_size
+                return content_size
+        except:
+            raise HTTPException(status_code=400, detail="Failed to retrieve content size from server. Please ensure the server supports partial content delivery.")
 
     async def __calculate_semantic_size(self, _bytes: int):
         units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
@@ -469,12 +439,12 @@ class DownloadManager:
 
         return missing_chunks if len(missing_chunks) > 0 else None
 
-    async def __combine_chunks(self, dfs: DownloadFileState):
+    async def __combine_chunks(self, dfs: DownloadFileState, kdm_settings: KDMSettings):
         folder = dfs.chunks_folder
         filename = dfs.filename
 
         print(f"\nCombining chunks in folder {folder} ...")
-        output_file_path = os.path.join(DOWNLOADS_FOLDER, filename)
+        output_file_path = os.path.join(kdm_settings.downloads_location, filename)
 
         with open(output_file_path, 'wb') as output_file:
             files = os.listdir(folder)
@@ -497,7 +467,7 @@ class DownloadManager:
                     output_file.write(data)
 
             dfs.downloaded_file_path = output_file_path
-            await self.__update_download_states_now()
+            await sadbs.insert(dfs)
             shutil.rmtree(folder)
             formatted_size = await self.__calculate_semantic_size(written_bytes)
             print(f"Combined chunks in folder: {folder} as file: {filename}. {formatted_size} written.")
@@ -521,22 +491,5 @@ class DownloadManager:
             ...
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="File Downloader with pause and resume capability.")
-    parser.add_argument('url', help="URL parameter")
-    parser.add_argument('--max-connections', type=int, default=8, help="Maximum number of connections")
-    parser.add_argument('--chunk-size', type=int, default=512000, help="Chunk size")
-    parser.add_argument('--cap', type=int, help="Size Cap parameter")
-    parser.add_argument('--save-as', help="Save as parameter")
-
-    args = parser.parse_args()
-
-    dm = DownloadManager()
-
-    await dm.add(**args.__dict__)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-cmd = "python download_manager.py https://dl4.dl1acemovies.xyz/dl/English/Series/Invincible/S02/720p/Invincible.S02E08.720p.AMZN.WEB-DL.2CH.H.264.AM.mkv --max-connections 10 --chunk-size 512000"
+kdm = KDownloadService()
+asyncio.create_task(kdm.init())
