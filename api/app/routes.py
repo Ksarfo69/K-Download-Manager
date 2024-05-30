@@ -8,6 +8,9 @@ from app.middlewares import log_request
 from app.schemas import KDMSettingsPayload, DownloadFileStateResponse, DownloadRequest
 from app.services.download_service import kdm
 
+from app.schemas import DirectoryListingRequest
+from app.services.folder_picker_service import fp
+
 router = APIRouter(prefix="/api", dependencies=[Depends(log_request)])
 
 
@@ -23,19 +26,25 @@ async def download(p: DownloadRequest) -> DownloadFileStateResponse:
     return r
 
 
-@router.post("/resume/{f_id}", status_code=204)
-async def resume(f_id: str):
-    ...
+@router.post("/resume/{f_id}", status_code=200)
+async def resume(f_id: str) -> DownloadFileStateResponse:
+    r = await kdm.resume(f_id)
+    return r
 
 
-@router.post("/pause/{f_id}", status_code=204)
+@router.post("/pause/{f_id}", status_code=202)
 async def pause(f_id: str):
-    ...
+    await kdm.pause(f_id)
 
 
 @router.delete("/delete/{f_id}", status_code=204)
 async def delete(f_id: str):
     ...
+
+
+@router.get("/open/{f_id}", status_code=200)
+async def open_containing_folder(f_id: str):
+    await kdm.open_containing_folder(f_id)
 
 
 @router.get("/preferences", status_code=200)
@@ -49,6 +58,24 @@ async def update_preferences(preferences: KDMSettingsPayload):
     await kdm.update_preferences(preferences)
 
 
+@router.get("/folders", status_code=200)
+async def get_home_dir():
+    r = await fp.home()
+    return r
+
+
+@router.post("/folders/goto", status_code=200)
+async def go_to_folder(dlr: DirectoryListingRequest):
+    r = await fp.goto(dlr)
+    return r
+
+
+@router.post("/folders/select", status_code=200)
+async def select_folder(dlr: DirectoryListingRequest):
+    r = await fp.select(dlr)
+    return r
+
+
 @router.get("/events", status_code=200)
 async def get_events():
     async def event_generator():
@@ -57,8 +84,7 @@ async def get_events():
 
             if events:
                 s = json.dumps(events)
-                yield s
+                yield f"data: {s}\n\n"
 
             await asyncio.sleep(1)
-
     return StreamingResponse(event_generator(), media_type="text/event-stream")

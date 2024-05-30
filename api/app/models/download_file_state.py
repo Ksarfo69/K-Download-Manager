@@ -23,6 +23,7 @@ class DownloadFileState(Base):
     formatted_content_size = Column(String)
     complete = Column(Boolean, nullable=False)
     in_progress = Column(Boolean, nullable=False)
+    date_added = Column(DateTime, nullable=False)
     download_start = Column(DateTime, nullable=False)
     downloaded_size_this_session = Column(Integer, nullable=False)
     downloaded_file_path = Column(String)
@@ -41,9 +42,8 @@ class DownloadFileState(Base):
                  in_progress,
                  download_start,
                  downloaded_size_this_session,
-                 downloaded_file_path,
-                 id=uuid.uuid4().hex):
-        self.id = id
+                 downloaded_file_path):
+        self.id = uuid.uuid4().hex
         self.url = url
         self.max_connections = max_connections
         self.chunk_size = chunk_size
@@ -56,6 +56,7 @@ class DownloadFileState(Base):
         self.in_progress = in_progress
         self.formatted_content_size = formatted_content_size
         self.download_start = download_start
+        self.date_added = datetime.now()
         self.downloaded_size_this_session = downloaded_size_this_session
         self.downloaded_file_path = downloaded_file_path
 
@@ -79,6 +80,12 @@ class DownloadFileState(Base):
         self.in_progress = True
         self.downloaded_size = 0
 
+    def pausing(self):
+        self.in_progress = False
+
+        if self.downloaded_size >= self.content_size:
+            self.complete = True
+
     def add_chunk(self, size: int):
         self.downloaded_size += size
         self.downloaded_size_this_session += size
@@ -101,7 +108,8 @@ class DownloadFileState(Base):
             formatted_content_size=self.formatted_content_size,
             complete=self.complete,
             in_progress=self.in_progress,
-            download_start=self.download_start,
+            date_added=str(self.date_added),
+            download_start=str(self.download_start),
             downloaded_size_this_session=self.downloaded_size_this_session,
             downloaded_file_path=self.downloaded_file_path,
         )

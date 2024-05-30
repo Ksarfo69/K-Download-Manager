@@ -1,7 +1,6 @@
-from datetime import datetime
-from pathlib import Path
-
 from pydantic import BaseModel
+
+from app.enums import DirectoryFileType
 
 
 class DownloadRequest(BaseModel):
@@ -9,9 +8,9 @@ class DownloadRequest(BaseModel):
 
 
 class KDMSettingsPayload(BaseModel):
-    max_connections: int = 8
-    chunk_size: int = 512000
-    downloads_location: str = Path.home() / 'Downloads'
+    max_connections: int
+    chunk_size: int
+    downloads_location: str
 
 
 class DownloadFileStateResponse(BaseModel):
@@ -27,6 +26,22 @@ class DownloadFileStateResponse(BaseModel):
     formatted_content_size: str
     complete: bool
     in_progress: bool
-    download_start: datetime
+    date_added: str
+    download_start: str
     downloaded_size_this_session: int
     downloaded_file_path: str | None
+
+
+class DirectoryItem(BaseModel):
+    filename: str
+    kind: DirectoryFileType
+
+
+class DirectoryListing(BaseModel):
+    base: str
+    items: list[DirectoryItem]
+
+
+class DirectoryListingRequest(BaseModel):
+    base: str
+    filename: str
